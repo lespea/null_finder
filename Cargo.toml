@@ -4,13 +4,12 @@ version = "0.1.0"
 authors = ["Adam Lesperance <lespea@gmail.com>"]
 
 [dependencies]
-clap = "2.17"
+#clap = "2.17"
 crossbeam = "0.2"
 csv = "0.14"
-docopt = "0.6"
-#lazy_static = "0.2"
+#docopt = "0.6"
+num_cpus = "1.1"
 quick-csv = "0.1"
-#regex = "0.1"
 walkdir = "0.1"
 zip = "0.2"
 
