@@ -1,22 +1,24 @@
 extern crate crossbeam;
+extern crate csv;
+extern crate num_cpus;
+extern crate quick_csv;
 extern crate walkdir;
 extern crate zip;
-extern crate quick_csv;
-extern crate num_cpus;
 
 use crossbeam::sync::chase_lev;
-use crossbeam::sync::chase_lev::Steal;
+use crossbeam::sync::chase_lev::{Steal, Worker};
 use std::ascii::AsciiExt;
 use std::borrow::Borrow;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
 use std::str;
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use walkdir::WalkDir;
 
 static WANTED_COL: &'static str = "b";
 static ZIP_FILE: &'static str = r"t/q.csv";
+static OUT_FILE: &'static str = "findings.csv";
 static FILTER_CHAR: char = '2';
 
 enum Work {
@@ -24,7 +26,6 @@ enum Work {
     File(PathBuf),
 }
 
-#[derive(Debug)]
 struct Row {
     file: PathBuf,
     row: Vec<String>,
@@ -76,12 +77,75 @@ fn proc_zip(path: PathBuf, sender: &Sender<Finding>) -> std::result::Result<(), 
     Ok(())
 }
 
+fn proc_findings(found_rx: Receiver<Finding>) {
+    let mut header = None;
+    let mut out_file = None;
+
+    for finding in found_rx {
+        match finding {
+            Finding::Header(h) => {
+                match header {
+                    Some(ref cur_header) => {
+                        if *cur_header != h.row {
+                            panic!("The header from '{:?}' ({:?}) doesn't match the \
+                                            expected header ({:?})",
+                                   h.file,
+                                   h.row,
+                                   *cur_header)
+                        }
+                    }
+                    None => header = Some(h.row),
+                };
+            }
+
+            Finding::MatchedRow(r) => {
+                if let None = out_file {
+                    let mut csv_writer = csv::Writer::from_file(OUT_FILE).unwrap();
+                    let mut hrow = header.as_ref().expect("Row before header???").clone();
+                    hrow.insert(0, "file_path".to_string());
+                    csv_writer.encode(hrow).unwrap();
+                    out_file = Some(csv_writer);
+                }
+
+                let mut row = r.row;
+                row.insert(0,
+                           r.file
+                               .to_string_lossy()
+                               .as_ref()
+                               .to_string());
+                out_file.as_mut().unwrap().encode(row).unwrap();
+            }
+        };
+    }
+}
+
+fn find_and_proc_zips(start_dir: PathBuf, worker: &mut Worker<Work>) {
+    for entry in WalkDir::new(start_dir)
+        .follow_links(true)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy();
+            let str: &str = name.borrow();
+
+            if str.len() > 4 {
+                str[str.len() - 4..].eq_ignore_ascii_case(".zip")
+            } else {
+                false
+            }
+        }) {
+        worker.push(Work::File(entry.path().to_path_buf()))
+    }
+}
+
 fn main() {
+    let num_workers = num_cpus::get();
+
     crossbeam::scope(|scope| {
         let (mut worker, stealer) = chase_lev::deque();
         let (found_tx, found_rx) = channel();
 
-        for _ in 0..num_cpus::get() {
+        for _ in 0..num_workers {
             let stealer = stealer.clone();
             let found_tx = found_tx.clone();
 
@@ -100,36 +164,11 @@ fn main() {
             });
         }
 
-        scope.spawn(move || {
-            //            let mut header = None;
+        scope.spawn(move || proc_findings(found_rx));
 
-            for finding in found_rx {
-                match finding {
-                    Finding::Header(h) => (),
+        find_and_proc_zips(PathBuf::from("."), &mut worker);
 
-                    Finding::MatchedRow(r) => println!("Row :: {:?}", r),
-                }
-            }
-        });
-
-        for entry in WalkDir::new(".")
-            .follow_links(true)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                let name = e.file_name().to_string_lossy();
-                let str: &str = name.borrow();
-
-                if str.len() > 4 {
-                    str[str.len() - 4..].eq_ignore_ascii_case(".zip")
-                } else {
-                    false
-                }
-            }) {
-            worker.push(Work::File(entry.path().to_path_buf()))
-        }
-
-        for _ in 0..num_cpus::get() {
+        for _ in 0..num_workers {
             worker.push(Work::Quit)
         }
     })
