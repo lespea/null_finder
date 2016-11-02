@@ -18,10 +18,7 @@ use std::str;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use walkdir::WalkDir;
 
-static WANTED_COL: &'static str = "b";
-static ZIP_FILE: &'static str = r"t/q.csv";
-static FILTER_CHAR: char = '2';
-
+static FILTER_CHAR: char = '\x00';
 
 enum Work {
     Quit,
@@ -38,18 +35,22 @@ enum Finding {
     MatchedRow(Row),
 }
 
-fn proc_zip(path: PathBuf, sender: &Sender<Finding>) -> std::result::Result<(), std::io::Error> {
+fn proc_zip(path: PathBuf,
+            csv_path: &str,
+            wanted_col: &str,
+            sender: &Sender<Finding>)
+            -> std::result::Result<(), std::io::Error> {
     let fh = File::open(path.as_path())?;
     let mut zip = zip::ZipArchive::new(BufReader::new(fh))?;
 
-    if let Ok(z_file) = zip.by_name(ZIP_FILE) {
+    if let Ok(z_file) = zip.by_name(csv_path) {
         let mut csv = quick_csv::Csv::from_reader(BufReader::new(z_file)).has_header(true);
 
         let headers = csv.headers();
         if !headers.is_empty() {
             let want_idx = headers.iter()
                 .enumerate()
-                .find(|&(_, h)| h.eq_ignore_ascii_case(WANTED_COL))
+                .find(|&(_, h)| h.eq_ignore_ascii_case(wanted_col))
                 .map(|(i, _)| i);
 
             if let Some(idx) = want_idx {
@@ -119,6 +120,16 @@ fn proc_findings(out_path: &str, found_rx: Receiver<Finding>) {
             }
         };
     }
+
+    // If we didn't find anything, create an empty file so as not to confuse the
+    // caller
+    if let None = out_file {
+        let mut csv_writer = csv::Writer::from_file(out_path).unwrap();
+        if let Some(mut hrow) = header {
+            hrow.insert(0, "file_path".to_string());
+            csv_writer.encode(hrow).unwrap();
+        }
+    }
 }
 
 fn find_and_proc_zips(start_dirs: Vec<String>, worker: &mut Worker<Work>) {
@@ -144,9 +155,20 @@ fn find_and_proc_zips(start_dirs: Vec<String>, worker: &mut Worker<Work>) {
 
 fn main() {
     let args = App::new("null_finder")
-        .about("Finds rows with nulls in csvs in embedded zips")
+        .about("Finds rows where the specified column starts with a null in the csv in the \
+                embedded zips")
         .version("1.0")
         .author("Adam Lesperance <lespea@gmail.com>")
+        .arg(Arg::with_name("wanted_col")
+            .help("the column name to search")
+            .short("c")
+            .long("column")
+            .default_value("b"))
+        .arg(Arg::with_name("csv_path")
+            .help("path of the csv inside the zip file")
+            .short("p")
+            .long("csv_path")
+            .default_value(r"test.csv"))
         .arg(Arg::with_name("output_file")
             .help("where to write the findings to")
             .required(true))
@@ -155,6 +177,9 @@ fn main() {
             .multiple(true)
             .required(true))
         .get_matches();
+
+    let wanted_col = args.value_of_lossy("wanted_col").unwrap();
+    let csv_path = args.value_of_lossy("csv_path").unwrap();
 
     let out_path = args.value_of_lossy("output_file").unwrap();
     let in_dirs = args.values_of_lossy("search_dirs").unwrap();
@@ -169,6 +194,9 @@ fn main() {
             let stealer = stealer.clone();
             let found_tx = found_tx.clone();
 
+            let csv_path = csv_path.clone();
+            let wanted_col = wanted_col.clone();
+
             scope.spawn(move || loop {
                 match stealer.steal() {
                     Steal::Empty | Steal::Abort => (),
@@ -176,7 +204,10 @@ fn main() {
                         match d {
                             Work::Quit => break,
                             Work::File(path) => {
-                                let _ = proc_zip(path, &found_tx);
+                                let _ = proc_zip(path,
+                                                 csv_path.borrow(),
+                                                 wanted_col.borrow(),
+                                                 &found_tx);
                             }
                         };
                     }
