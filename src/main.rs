@@ -133,6 +133,7 @@ fn proc_findings(out_path: &str, found_rx: Receiver<Finding>) {
         let mut csv_writer = csv::Writer::from_file(out_path).unwrap();
         if let Some(mut hrow) = header {
             hrow.insert(0, "file_path".to_string());
+            hrow.insert(1, "line_num".to_string());
             csv_writer.encode(hrow).unwrap();
         }
     }
@@ -174,7 +175,7 @@ fn main() {
             .help("regex of ")
             .short("p")
             .long("csv_regex")
-            .default_value(r".*\wregistry.*\.csv$"))
+            .default_value(r".*registry.*\.csv$"))
         .arg(Arg::with_name("output_file")
             .help("where to write the findings to")
             .required(true))
