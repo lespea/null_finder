@@ -1,8 +1,10 @@
 extern crate crossbeam;
 extern crate csv;
 extern crate clap;
+extern crate memchr;
 extern crate num_cpus;
 extern crate quick_csv;
+extern crate regex;
 extern crate walkdir;
 extern crate zip;
 
@@ -18,62 +20,71 @@ use std::str;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use walkdir::WalkDir;
 
-static FILTER_CHAR: char = '\x00';
+static FILTER_CHAR: u8 = b'\x00';
 
 enum Work {
     Quit,
     File(PathBuf),
 }
 
-struct Row {
+struct HeaderRow {
     file: PathBuf,
     row: Vec<String>,
 }
 
 enum Finding {
-    Header(Row),
-    MatchedRow(Row),
+    Header(HeaderRow),
+    MatchedRow(Vec<String>),
 }
 
 fn proc_zip(path: PathBuf,
-            csv_path: &str,
+            csv_path: &regex::Regex,
             wanted_col: &str,
             sender: &Sender<Finding>)
             -> std::result::Result<(), std::io::Error> {
     let fh = File::open(path.as_path())?;
     let mut zip = zip::ZipArchive::new(BufReader::new(fh))?;
 
-    if let Ok(z_file) = zip.by_name(csv_path) {
-        let mut csv = quick_csv::Csv::from_reader(BufReader::new(z_file)).has_header(true);
+    for idx in 0..zip.len() {
+        if let Ok(z_file) = zip.by_index(idx) {
+            if !csv_path.is_match(z_file.name()) {
+                continue;
+            }
+            let csv_path = format!("{}:{}", path.to_string_lossy(), z_file.name());
+            println!("Processing '{}'", csv_path);
 
-        let headers = csv.headers();
-        if !headers.is_empty() {
-            let want_idx = headers.iter()
-                .enumerate()
-                .find(|&(_, h)| h.eq_ignore_ascii_case(wanted_col))
-                .map(|(i, _)| i);
+            let mut csv = quick_csv::Csv::from_reader(BufReader::new(z_file)).has_header(true);
 
-            if let Some(idx) = want_idx {
-                let _ = sender.send(Finding::Header(Row {
-                    file: path.clone(),
-                    row: headers,
-                }));
+            let headers = csv.headers();
+            if !headers.is_empty() {
+                let want_idx = headers.iter()
+                    .enumerate()
+                    .find(|&(_, h)| h.eq_ignore_ascii_case(wanted_col))
+                    .map(|(i, _)| i);
 
-                for row in csv.filter_map(|e| e.ok()) {
-                    if let Ok(mut cols) = row.columns() {
-                        if let Some(data) = cols.nth(idx) {
-                            if data.starts_with(FILTER_CHAR) {
+                if let Some(idx) = want_idx {
+                    let _ = sender.send(Finding::Header(HeaderRow {
+                        file: path.clone(),
+                        row: headers,
+                    }));
+
+                    for (row_num, row) in csv.filter_map(|e| e.ok()).enumerate() {
+                        if let Some(data) = row.bytes_columns().nth(idx) {
+                            if memchr::memchr(FILTER_CHAR, data).is_some() {
                                 if let Ok(cols) = row.columns() {
-                                    let _ = sender.send(Finding::MatchedRow(Row {
-                                        file: path.clone(),
-                                        row: cols.map(|c| c.to_string()).collect(),
-                                    }));
+                                    let mut data = Vec::with_capacity(cols.len() + 2);
+
+                                    data.push(csv_path.to_string());
+                                    data.push(format!("{}", row_num).to_string());
+                                    data.extend(cols.map(|s| s.to_string()));
+
+                                    let _ = sender.send(Finding::MatchedRow(data));
                                 }
                             }
                         }
                     }
-                }
-            };
+                };
+            }
         }
     }
 
@@ -101,21 +112,16 @@ fn proc_findings(out_path: &str, found_rx: Receiver<Finding>) {
                 };
             }
 
-            Finding::MatchedRow(r) => {
+            Finding::MatchedRow(row) => {
                 if let None = out_file {
                     let mut csv_writer = csv::Writer::from_file(out_path).unwrap();
                     let mut hrow = header.as_ref().expect("Row before header???").clone();
                     hrow.insert(0, "file_path".to_string());
+                    hrow.insert(1, "line_num".to_string());
                     csv_writer.encode(hrow).unwrap();
                     out_file = Some(csv_writer);
                 }
 
-                let mut row = r.row;
-                row.insert(0,
-                           r.file
-                               .to_string_lossy()
-                               .as_ref()
-                               .to_string());
                 out_file.as_mut().unwrap().encode(row).unwrap();
             }
         };
@@ -163,12 +169,12 @@ fn main() {
             .help("the column name to search")
             .short("c")
             .long("column")
-            .default_value("b"))
+            .default_value("Key"))
         .arg(Arg::with_name("csv_path")
-            .help("path of the csv inside the zip file")
+            .help("regex of ")
             .short("p")
-            .long("csv_path")
-            .default_value(r"test.csv"))
+            .long("csv_regex")
+            .default_value(r".*\wregistry.*\.csv$"))
         .arg(Arg::with_name("output_file")
             .help("where to write the findings to")
             .required(true))
@@ -179,7 +185,7 @@ fn main() {
         .get_matches();
 
     let wanted_col = args.value_of_lossy("wanted_col").unwrap();
-    let csv_path = args.value_of_lossy("csv_path").unwrap();
+    let file_regex = &regex::Regex::new(args.value_of_lossy("csv_path").unwrap().borrow()).unwrap();
 
     let out_path = args.value_of_lossy("output_file").unwrap();
     let in_dirs = args.values_of_lossy("search_dirs").unwrap();
@@ -194,7 +200,6 @@ fn main() {
             let stealer = stealer.clone();
             let found_tx = found_tx.clone();
 
-            let csv_path = csv_path.clone();
             let wanted_col = wanted_col.clone();
 
             scope.spawn(move || loop {
@@ -204,10 +209,7 @@ fn main() {
                         match d {
                             Work::Quit => break,
                             Work::File(path) => {
-                                let _ = proc_zip(path,
-                                                 csv_path.borrow(),
-                                                 wanted_col.borrow(),
-                                                 &found_tx);
+                                let _ = proc_zip(path, file_regex, wanted_col.borrow(), &found_tx);
                             }
                         };
                     }
