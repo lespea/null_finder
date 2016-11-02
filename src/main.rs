@@ -1,10 +1,12 @@
 extern crate crossbeam;
 extern crate csv;
+extern crate clap;
 extern crate num_cpus;
 extern crate quick_csv;
 extern crate walkdir;
 extern crate zip;
 
+use clap::{Arg, App};
 use crossbeam::sync::chase_lev;
 use crossbeam::sync::chase_lev::{Steal, Worker};
 use std::ascii::AsciiExt;
@@ -18,8 +20,8 @@ use walkdir::WalkDir;
 
 static WANTED_COL: &'static str = "b";
 static ZIP_FILE: &'static str = r"t/q.csv";
-static OUT_FILE: &'static str = "findings.csv";
 static FILTER_CHAR: char = '2';
+
 
 enum Work {
     Quit,
@@ -77,7 +79,7 @@ fn proc_zip(path: PathBuf, sender: &Sender<Finding>) -> std::result::Result<(), 
     Ok(())
 }
 
-fn proc_findings(found_rx: Receiver<Finding>) {
+fn proc_findings(out_path: &str, found_rx: Receiver<Finding>) {
     let mut header = None;
     let mut out_file = None;
 
@@ -100,7 +102,7 @@ fn proc_findings(found_rx: Receiver<Finding>) {
 
             Finding::MatchedRow(r) => {
                 if let None = out_file {
-                    let mut csv_writer = csv::Writer::from_file(OUT_FILE).unwrap();
+                    let mut csv_writer = csv::Writer::from_file(out_path).unwrap();
                     let mut hrow = header.as_ref().expect("Row before header???").clone();
                     hrow.insert(0, "file_path".to_string());
                     csv_writer.encode(hrow).unwrap();
@@ -119,29 +121,47 @@ fn proc_findings(found_rx: Receiver<Finding>) {
     }
 }
 
-fn find_and_proc_zips(start_dir: PathBuf, worker: &mut Worker<Work>) {
-    for entry in WalkDir::new(start_dir)
-        .follow_links(true)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            let name = e.file_name().to_string_lossy();
-            let str: &str = name.borrow();
+fn find_and_proc_zips(start_dirs: Vec<String>, worker: &mut Worker<Work>) {
+    for start_dir in start_dirs {
+        for entry in WalkDir::new(start_dir)
+            .follow_links(true)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy();
+                let str: &str = name.borrow();
 
-            if str.len() > 4 {
-                str[str.len() - 4..].eq_ignore_ascii_case(".zip")
-            } else {
-                false
-            }
-        }) {
-        worker.push(Work::File(entry.path().to_path_buf()))
+                if str.len() > 4 {
+                    str[str.len() - 4..].eq_ignore_ascii_case(".zip")
+                } else {
+                    false
+                }
+            }) {
+            worker.push(Work::File(entry.path().to_path_buf()))
+        }
     }
 }
 
 fn main() {
+    let args = App::new("null_finder")
+        .about("Finds rows with nulls in csvs in embedded zips")
+        .version("1.0")
+        .author("Adam Lesperance <lespea@gmail.com>")
+        .arg(Arg::with_name("output_file")
+            .help("where to write the findings to")
+            .required(true))
+        .arg(Arg::with_name("search_dirs")
+            .help("the directories to search for zips")
+            .multiple(true)
+            .required(true))
+        .get_matches();
+
+    let out_path = args.value_of_lossy("output_file").unwrap();
+    let in_dirs = args.values_of_lossy("search_dirs").unwrap();
+
     let num_workers = num_cpus::get();
 
-    crossbeam::scope(|scope| {
+    crossbeam::scope(move |scope| {
         let (mut worker, stealer) = chase_lev::deque();
         let (found_tx, found_rx) = channel();
 
@@ -164,9 +184,9 @@ fn main() {
             });
         }
 
-        scope.spawn(move || proc_findings(found_rx));
+        scope.spawn(move || proc_findings(out_path.borrow(), found_rx));
 
-        find_and_proc_zips(PathBuf::from("."), &mut worker);
+        find_and_proc_zips(in_dirs, &mut worker);
 
         for _ in 0..num_workers {
             worker.push(Work::Quit)
